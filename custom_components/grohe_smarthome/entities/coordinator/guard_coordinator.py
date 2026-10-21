@@ -7,6 +7,7 @@ from grohe import GroheClient, GroheForbiddenError, GroheUnauthorizedError
 from grohe.enum.grohe_enum import GroheGroupBy
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from custom_components.grohe_smarthome.dto.config_dtos import DeviceConfigDto
@@ -68,6 +69,12 @@ class GuardCoordinator(
         self._log_response_data = log_response_data
         self._has_pressure_measurement = False
         self._initial_value_lock = asyncio.Lock()
+        self._storage = Store(
+            self.hass,
+            1,
+            f"grohe_total_{self._device.appliance_id}.json",
+        )
+        self._restore_done = False
 
         if (
             device_config is not None
@@ -78,6 +85,50 @@ class GuardCoordinator(
             )
             if device.stripped_sw_version >= pressure_version:
                 self._has_pressure_measurement = True
+
+    async def _async_restore_total_value(self) -> None:
+        if self._restore_done:
+            return
+
+        self._restore_done = True
+        try:
+            restored = await self._storage.async_load()
+        except Exception as e:  # pragma: no cover - defensive only
+            _LOGGER.warning(
+                "Could not restore last valid total for %s (%s): %s",
+                self._device.name,
+                self._device.appliance_id,
+                e,
+            )
+            return
+
+        if restored is None:
+            return
+
+        restored_total = restored.get("total_value")
+        if restored_total is not None:
+            try:
+                self._total_value = float(restored_total)
+            except (TypeError, ValueError):
+                self._total_value = 0.0
+
+        restored_day = restored.get("total_value_update_day")
+        if restored_day is not None:
+            try:
+                self._total_value_update_day = datetime.fromisoformat(restored_day)
+            except ValueError:
+                self._total_value_update_day = None
+
+    async def _async_persist_total_value(self) -> None:
+        payload = {
+            "total_value": self._total_value,
+            "total_value_update_day": (
+                self._total_value_update_day.isoformat()
+                if self._total_value_update_day is not None
+                else None
+            ),
+        }
+        await self._storage.async_save(payload)
 
     async def _get_total_value(
         self,
@@ -124,6 +175,8 @@ class GuardCoordinator(
             raise
 
     async def _get_data(self) -> dict[str, any]:
+        await self._async_restore_total_value()
+
         api_data = await self._api.get_appliance_details(
             self._device.location_id, self._device.room_id, self._device.appliance_id
         )
@@ -140,10 +193,14 @@ class GuardCoordinator(
         now = datetime.now().astimezone()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_date = now.date()
+        daily_total_fallback = float(
+            (api_data.get("data_latest") or {}).get("daily_consumption", 0) or 0.0
+        )
 
-        # Only refresh the historical baseline when the local date actually rolls over.
-        # This avoids midnight/restart spikes caused by re-running the install-to-now query
-        # while the daily total is still in flux.
+        # The daily sensor is useful as a sanity check for the current day, but it is not
+        # a lifetime total and should not replace the historical baseline. We use it only to
+        # guard against impossible jumps and to keep the last valid total stable across
+        # restarts / updates / short API failures.
         today_water_consumption = await self._get_total_value(
             today_start,
             now,
@@ -162,10 +219,17 @@ class GuardCoordinator(
                 request_timeout=HISTORICAL_TOTAL_VALUE_TIMEOUT,
             )
 
-            _LOGGER.debug(f"Old total water consumption: {self._total_value}")
-            self._total_value = max(round(historical_total, 2), 0)
-            _LOGGER.debug(f"New total water consumption: {self._total_value}")
-            self._total_value_update_day = now
+            # Use the historical total only when the API is healthy. If it comes back as 0 or
+            # invalid during a temporary outage, keep the last known valid lifetime total.
+            if historical_total > 0:
+                self._total_value = max(round(historical_total, 2), 0)
+                self._total_value_update_day = now
+                await self._async_persist_total_value()
+            elif self._total_value == 0 and daily_total_fallback > 0:
+                # This is a very limited fallback only for the very first valid successful read.
+                self._total_value = max(round(daily_total_fallback, 2), 0)
+                self._total_value_update_day = now
+                await self._async_persist_total_value()
 
         latest_data = api_data.get("data_latest") or {}
         _LOGGER.debug(
@@ -181,12 +245,29 @@ class GuardCoordinator(
             _LOGGER.debug(f"Status could not be mapped: {e}")
             status = None
 
+        current_total = self._total_value + today_water_consumption
+        if current_total < self._total_value and self._total_value_update_day is not None:
+            _LOGGER.warning(
+                "Ignoring lower-than-last total for %s (%s): current_total=%.2f last_total=%.2f",
+                self._device.name,
+                self._device.appliance_id,
+                current_total,
+                self._total_value,
+            )
+            current_total = self._total_value
+
         data = {
             "details": api_data,
             "status": status,
             "pressure": pressure,
-            "total_water_consumption": self._total_value + today_water_consumption,
+            "total_water_consumption": current_total,
         }
+
+        # Keep the total stable across restarts and updates by persisting the last valid
+        # total after each successful update. The daily sensor remains the day-level value and
+        # is used as a sanity check, not as the source of truth for the lifetime total.
+        self._total_value = max(round(self._total_value, 2), 0)
+        await self._async_persist_total_value()
 
         return data
 
