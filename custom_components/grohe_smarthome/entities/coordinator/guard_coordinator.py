@@ -111,8 +111,7 @@ class GuardCoordinator(
                 # Handle None values in waterconsumption
                 return sum([val.get("waterconsumption", 0) for val in withdrawals])
 
-            else:
-                return 0.0
+            return 0.0
 
         except (GroheUnauthorizedError, GroheForbiddenError):
             # Let auth/rate-limit errors propagate to _async_update_data, which knows how
@@ -122,7 +121,7 @@ class GuardCoordinator(
 
         except Exception as e:
             _LOGGER.error(f"Failed to get total values: {e}")
-            return 0.0
+            raise
 
     async def _get_data(self) -> dict[str, any]:
         api_data = await self._api.get_appliance_details(
@@ -142,10 +141,9 @@ class GuardCoordinator(
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_date = now.date()
 
-        # Query only the current day's totals. The historical total is recalculated only
-        # when the local date actually changes, which avoids the spurious spikes that can
-        # occur after a restart or near midnight when the previous logic re-ran the install-
-        # to-now query while the daily value was still changing.
+        # Only refresh the historical baseline when the local date actually rolls over.
+        # This avoids midnight/restart spikes caused by re-running the install-to-now query
+        # while the daily total is still in flux.
         today_water_consumption = await self._get_total_value(
             today_start,
             now,
@@ -157,21 +155,14 @@ class GuardCoordinator(
             or today_date > self._total_value_update_day.date()
         ):
             install_date = datetime.fromisoformat(api_data["installation_date"])
-            date_from = install_date
-            date_to = today_start
-            group_by = GroheGroupBy.YEAR
-
-            _LOGGER.debug(f"Old total water consumption: {self._total_value}")
             historical_total = await self._get_total_value(
-                date_from,
-                date_to,
-                group_by,
+                install_date,
+                today_start,
+                GroheGroupBy.YEAR,
                 request_timeout=HISTORICAL_TOTAL_VALUE_TIMEOUT,
             )
 
-            # Keep the historical baseline strictly non-negative, but do not subtract the
-            # current day from it here. The current-day value is added separately below, and
-            # subtracting it during a historical refresh is what creates the inflated values.
+            _LOGGER.debug(f"Old total water consumption: {self._total_value}")
             self._total_value = max(round(historical_total, 2), 0)
             _LOGGER.debug(f"New total water consumption: {self._total_value}")
             self._total_value_update_day = now
